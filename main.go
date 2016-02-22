@@ -100,9 +100,9 @@ func run() error {
 }
 
 func locateSession(name string) (string, error) {
-	if _, err := os.Stat(name); err == nil {
+	if info, err := os.Stat(name); err == nil && !info.IsDir() {
 		return name, nil
-	} else if !os.IsNotExist(err) {
+	} else if err != nil && !os.IsNotExist(err) {
 		return "", errgo.Notef(err, "failed to open session file %q", name)
 	}
 
