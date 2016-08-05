@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -9,9 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/alecthomas/template"
+
 	"gopkg.in/errgo.v1"
 	"gopkg.in/yaml.v2"
 )
+
+var userFlag = flag.String("user", "", "default github user")
+var projectFlag = flag.String("project", "", "default github project")
+var editFlag = flag.Bool("edit", false, "edit config")
+var setupFlag = flag.Bool("setup", false, "run project setup")
 
 type session struct {
 	Name        string            `yaml:"name"`
@@ -41,14 +49,23 @@ func main() {
 }
 
 func run() error {
-	if len(os.Args) < 2 {
+	flag.Parse()
+
+	if flag.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "usage: %s <session.yaml file>", os.Args[0])
 		return errgo.New("missing session file argument")
 	}
 
-	name, err := locateSession(os.Args[1])
+	name, err := locateSession(flag.Arg(0))
+	if os.IsNotExist(err) || *editFlag {
+		*setupFlag = true
+		err = newSessionFile(flag.Arg(0))
+	}
 	if err != nil {
 		return errgo.Mask(err)
+	}
+	if *editFlag {
+		os.Exit(0)
 	}
 
 	session, err := newSession(name)
@@ -59,12 +76,17 @@ func run() error {
 	for k, v := range session.Environment {
 		os.Setenv(k, os.ExpandEnv(v))
 	}
+	if _, err := os.Stat(session.Cwd); os.IsNotExist(err) {
+		*setupFlag = true
+	}
 
 	log.Println(os.Environ())
 
-	err = session.setupScript()
-	if err != nil {
-		return errgo.Notef(err, "failed to execute setup script")
+	if *setupFlag {
+		err = session.setupScript()
+		if err != nil {
+			return errgo.Notef(err, "failed to execute setup script")
+		}
 	}
 
 	err = session.create()
@@ -117,23 +139,126 @@ func locateSession(name string) (string, error) {
 		return "", errgo.Notef(err, "failed to create config directory %q", tmuxgConfigDir)
 	}
 
-	path := filepath.Join(tmuxgConfigDir, name+".yaml")
-	if _, err := os.Stat(path); err != nil {
-		return "", errgo.Notef(err, "failed to resolve session %q file %q", name, path)
+	confPath := filepath.Join(tmuxgConfigDir, name+".yaml")
+	if _, err := os.Stat(confPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", err
+		}
+		return "", errgo.Notef(err, "failed to resolve session %q file %q", name, confPath)
 	}
-	return path, nil
+	return confPath, nil
 }
 
-func newSession(path string) (*session, error) {
+const newTemplateContents = `
+# Name of the session. Probably don't mess with this.
+name: {{.Name}}
+
+# Environment variables set for the tmux session.
+environment:
+  GOPATH: ${HOME}/go/{{.Name}}
+
+# Current working directory for the tmux session. May use environment variables
+# declared above.
+cwd: ${GOPATH}/src/github.com/{{.User}}/{{.Project}}
+
+# Script to run the first time this session starts, or when specifically
+# invoked with -setup. Try to make this script idempotent.
+setup-script: |
+    #!/bin/bash
+    mkdir -p ${GOPATH}
+    go get -d github.com/{{.User}}/{{.Project}}/...
+
+# Windows to create in the tmux session and what to run in each.
+windows:
+  - name: editor
+    command: vim
+    keystrokes:
+      - \n
+  - name: shell
+focus: editor
+`
+
+var newTemplate = template.Must(template.New("new-conf").Parse(newTemplateContents))
+
+func newSessionFile(name string) error {
+	configDir := os.Getenv("XDG_CONFIG_HOME")
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+
+	tmuxgConfigDir := filepath.Join(configDir, "tmuxg")
+	err := os.MkdirAll(tmuxgConfigDir, 0644)
+	if err != nil {
+		return errgo.Notef(err, "failed to create config directory %q", tmuxgConfigDir)
+	}
+	confPath := filepath.Join(tmuxgConfigDir, name+".yaml")
+	err = createSessionFile(name, confPath)
+	if err != nil {
+		defer os.Remove(confPath)
+	}
+	return err
+}
+
+func createSessionFile(name, confPath string) error {
+	if _, err := os.Stat(confPath); os.IsNotExist(err) {
+		err = func() error {
+			f, err := os.Create(confPath)
+			if err != nil {
+				return errgo.Notef(err, "failed to open config file %q for writing", confPath)
+			}
+			defer f.Close()
+
+			user := *userFlag
+			if user == "" {
+				user = os.Getenv("USER")
+			}
+			project := *projectFlag
+			if project == "" {
+				project = name
+			}
+
+			err = newTemplate.Execute(f, struct {
+				Name, User, Project string
+			}{
+				Name:    name,
+				User:    user,
+				Project: project,
+			})
+			if err != nil {
+				return errgo.Notef(err, "failed to write config file %q", confPath)
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	cmd := exec.Command("vim", confPath)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		return errgo.Notef(err, "editor exited with error")
+	}
+	_, err = newSession(confPath)
+	return err
+}
+
+func newSession(confPath string) (*session, error) {
 	var s session
 
-	contents, err := ioutil.ReadFile(path)
+	contents, err := ioutil.ReadFile(confPath)
 	if err != nil {
 		return nil, errgo.Notef(err, "failed to read session file")
 	}
 	err = yaml.Unmarshal(contents, &s)
 	if err != nil {
 		return nil, errgo.Notef(err, "failed to parse session file")
+	}
+
+	for i := range s.Windows {
+		if s.Windows[i].Command == "" {
+			s.Windows[i].Command = "bash"
+		}
 	}
 	return &s, nil
 }
@@ -192,9 +317,9 @@ func (s *session) create() error {
 
 	var keys []string
 	for k, v := range s.Environment {
-		err = s.tmux("set-environment", k, os.ExpandEnv(v))
+		err = s.tmux("set-environment", "-t", s.Name, k, os.ExpandEnv(v))
 		if err != nil {
-			return errgo.Notef(err, "failed to set environment variable %q", k)
+			return errgo.Notef(err, "warning: failed to set environment variable %q", k)
 		}
 		keys = append(keys, k)
 	}
