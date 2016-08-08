@@ -9,8 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/alecthomas/template"
+	"text/template"
 
 	"gopkg.in/errgo.v1"
 	"gopkg.in/yaml.v2"
